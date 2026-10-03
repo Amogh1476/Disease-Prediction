@@ -83,7 +83,7 @@ Disease_Project/
 
 ### Step 1: Clone the Repository
 ```powershell
-git clone https://github.com/your-username/Disease_Project.git
+git clone https://github.com/Amogh1476/Disease_Project.git
 cd Disease_Project
 ```
 
