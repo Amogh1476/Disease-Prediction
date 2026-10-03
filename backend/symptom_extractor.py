@@ -138,31 +138,202 @@ SYMPTOM_SYNONYMS: Dict[str, List[str]] = {
     "yellow_crust_ooze": ["yellow crust ooze", "crusty skin", "oozing yellow fluid", "impetigo crusts"]
 }
 
+import sys
+import difflib
+
+try:
+    from rapidfuzz import process, fuzz
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    HAS_RAPIDFUZZ = False
+
+# Global target symptom vocabulary caches for fast rapidfuzz / difflib lookup
+_TARGET_VOCAB_WORDS = set()
+_TARGET_VOCAB_LIST = []
+
+_COMMON_ABBREVIATIONS: Dict[str, str] = {
+    "pn": "pain",
+    "cof": "cough",
+    "stomch": "stomach",
+    "fevr": "fever",
+    "hedache": "headache",
+    "vommiting": "vomiting",
+    "brethe": "breathe",
+    "cant": "can't"
+}
+
+_ENGLISH_STOPWORDS = {
+    "i", "have", "a", "an", "and", "or", "the", "with", "my", "in", "on", "at", "for",
+    "to", "from", "feeling", "feel", "has", "had", "is", "am", "are", "was", "were",
+    "been", "being", "some", "very", "severe", "bad", "lot", "of", "also", "suffering"
+}
+
+
+def _initialize_vocab(symptom_columns: List[str] = None):
+    """
+    Initializes target symptom vocabulary from SYMPTOM_SYNONYMS and symptom_columns.
+    Extracts all words across all 132 symptom names and synonym phrases into _TARGET_VOCAB_WORDS.
+    """
+    global _TARGET_VOCAB_WORDS, _TARGET_VOCAB_LIST
+    if _TARGET_VOCAB_WORDS:
+        return
+
+    words = set()
+    for key, phrases in SYMPTOM_SYNONYMS.items():
+        for word in key.replace('_', ' ').split():
+            clean_w = re.sub(r'[^a-z0-9]', '', word.lower())
+            if len(clean_w) >= 2:
+                words.add(clean_w)
+        for phrase in phrases:
+            for word in phrase.lower().split():
+                clean_w = re.sub(r'[^a-z0-9]', '', word)
+                if len(clean_w) >= 2:
+                    words.add(clean_w)
+
+    if symptom_columns:
+        for col in symptom_columns:
+            for word in col.replace('_', ' ').split():
+                clean_w = re.sub(r'[^a-z0-9]', '', word.lower())
+                if len(clean_w) >= 2:
+                    words.add(clean_w)
+
+    _TARGET_VOCAB_WORDS = words
+    _TARGET_VOCAB_LIST = sorted(list(words))
+
+
+def fuzzy_match_token(word: str, target_list: List[str], similarity_threshold: float = 90.0) -> Tuple[str, float]:
+    """
+    Fuzzy matches a single token against the target symptom vocabulary.
+    Uses rapidfuzz (preferred) or difflib (fallback).
+    
+    Requirement 8:
+    1. First tries primary similarity metric (ratio) with >= 90.0% threshold.
+    2. If similarity < 90.0%, tries partial_ratio, token_sort_ratio, token_set_ratio.
+    """
+    clean_word = word.lower().strip()
+    if not clean_word:
+        return word, 100.0
+
+    # Common medical abbreviations & phonetic shortcuts mapping
+    if clean_word in _COMMON_ABBREVIATIONS:
+        corrected = _COMMON_ABBREVIATIONS[clean_word]
+        score = 80.0
+        if HAS_RAPIDFUZZ:
+            score = float(fuzz.ratio(clean_word, corrected))
+            if score < 70:
+                score = float(fuzz.partial_ratio(clean_word, corrected))
+                if score < 70:
+                    score = 80.0
+        return corrected, score
+
+    if clean_word in _TARGET_VOCAB_WORDS:
+        return clean_word, 100.0
+
+    if HAS_RAPIDFUZZ:
+        # Step 1: Try ratio matching with 90% threshold
+        match = process.extractOne(clean_word, target_list, scorer=fuzz.ratio)
+        if match and match[1] >= similarity_threshold:
+            return match[0], float(match[1])
+
+        # Step 2 (Req 8): Fallback to partial_ratio, token_sort_ratio, token_set_ratio, WRatio
+        best_candidate = None
+        best_score = 0.0
+
+        for scorer in [fuzz.partial_ratio, fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.WRatio]:
+            m = process.extractOne(clean_word, target_list, scorer=scorer)
+            if m and m[1] > best_score:
+                best_candidate = m[0]
+                best_score = float(m[1])
+
+        if best_candidate and best_score >= 60.0:
+            return best_candidate, round(best_score, 1)
+    else:
+        # Fallback using difflib when rapidfuzz is unavailable
+        matches = difflib.get_close_matches(clean_word, target_list, n=1, cutoff=0.6)
+        if matches:
+            matched_word = matches[0]
+            ratio = difflib.SequenceMatcher(None, clean_word, matched_word).ratio() * 100
+            return matched_word, round(ratio, 1)
+
+    return word, 0.0
+
 
 def clean_text(text: str) -> str:
-    """Lowercase text and clean special punctuation for robust pattern matching."""
+    """Lowercase text, remove punctuation, and normalize extra spaces."""
     if not text:
         return ""
     text = text.lower().strip()
-    # Replace hyphens/underscores with space
+    text = re.sub(r"[^\w\s']", ' ', text)
     text = re.sub(r'[-_]', ' ', text)
-    # Remove excessive whitespace
     text = re.sub(r'\s+', ' ', text)
     return text
 
 
+def correct_spelling(text: str, symptom_columns: List[str] = None, similarity_threshold: float = 90.0) -> str:
+    """
+    Preprocesses natural language input to auto-correct misspelled words using rapidfuzz / difflib similarity matching.
+    Matches tokens against all 132 symptom names and synonym vocabulary.
+    Returns the corrected sentence string.
+    """
+    if not text or not text.strip():
+        return ""
+
+    _initialize_vocab(symptom_columns)
+
+    cleaned = text.lower().strip()
+    cleaned = re.sub(r"[^\w\s']", ' ', cleaned)
+    cleaned = re.sub(r'[-_]', ' ', cleaned)
+    tokens = re.findall(r"\b[a-zA-Z']+\b", cleaned)
+
+    corrected_tokens = []
+
+    for word in tokens:
+        word_clean = word.lower()
+        if word_clean in _ENGLISH_STOPWORDS and word_clean not in ["can't", "cant"]:
+            corrected_tokens.append(word)
+            continue
+
+        corrected_word, _ = fuzzy_match_token(word_clean, _TARGET_VOCAB_LIST, similarity_threshold=similarity_threshold)
+        corrected_tokens.append(corrected_word)
+
+    return " ".join(corrected_tokens)
+
+
 def extract_symptoms(text: str, symptom_columns: List[str]) -> List[str]:
     """
-    Given natural language text, extracts matched symptom keys matching symptom_columns.pkl.
-    Uses multi-word phrase matching and boundary regex.
+    Given natural language text, auto-corrects spelling mistakes, extracts matched symptom keys matching symptom_columns.pkl,
+    and prints debugging information for the user input, corrected words, and detected symptoms.
     """
-    cleaned_input = clean_text(text)
-    if not cleaned_input:
+    if not text or not text.strip():
         return []
+
+    _initialize_vocab(symptom_columns)
+
+    cleaned_raw = text.lower().strip()
+    cleaned_raw = re.sub(r"[^\w\s']", ' ', cleaned_raw)
+    cleaned_raw = re.sub(r'[-_]', ' ', cleaned_raw)
+    tokens = re.findall(r"\b[a-zA-Z']+\b", cleaned_raw)
+
+    corrected_tokens = []
+    corrections_log = []
+
+    for word in tokens:
+        word_clean = word.lower()
+        if word_clean in _ENGLISH_STOPWORDS and word_clean not in ["can't", "cant"]:
+            corrected_tokens.append(word)
+            continue
+
+        corrected_word, score = fuzzy_match_token(word_clean, _TARGET_VOCAB_LIST, similarity_threshold=90.0)
+        corrected_tokens.append(corrected_word)
+        if word_clean != corrected_word.lower():
+            corrections_log.append((word, corrected_word, score))
+
+    corrected_sentence = " ".join(corrected_tokens)
+    cleaned_input = clean_text(corrected_sentence)
 
     detected_symptoms = set()
 
-    # 1. Match phrases from SYMPTOM_SYNONYMS
+    # 1. Multi-word phrase matching from SYMPTOM_SYNONYMS
     for symptom_key, phrases in SYMPTOM_SYNONYMS.items():
         if symptom_key in symptom_columns or any(col.strip() == symptom_key.strip() for col in symptom_columns):
             for phrase in phrases:
@@ -172,19 +343,32 @@ def extract_symptoms(text: str, symptom_columns: List[str]) -> List[str]:
                     detected_symptoms.add(symptom_key)
                     break
 
-    # 2. Fallback: match direct column names (replacing underscores with spaces)
+    # 2. Direct column name matching (replacing underscores with spaces)
     for col in symptom_columns:
         col_clean = clean_text(col)
-        if len(col_clean) > 3:
+        if len(col_clean) >= 3:
             pattern = r'\b' + re.escape(col_clean) + r'\b'
             if re.search(pattern, cleaned_input):
                 detected_symptoms.add(col)
 
-    # Return list maintaining original column casing/formatting from symptom_columns
-    result = []
-    for col in symptom_columns:
-        if col in detected_symptoms:
-            result.append(col)
+    # Maintain original column casing/formatting from symptom_columns
+    result = [col for col in symptom_columns if col in detected_symptoms]
+
+    # Requirement 7: Print debugging information
+    print(f"\nUser input:\n\"{text}\"")
+    if corrections_log:
+        print("Corrected words:")
+        for orig, corr, sc in corrections_log:
+            print(f"{orig} -> {corr} ({sc:.0f}%)")
+    else:
+        print("Corrected words: None")
+    print("Detected symptoms:")
+    if result:
+        for sym in result:
+            print(f"- {sym}")
+    else:
+        print("None")
+
     return result
 
 
@@ -200,3 +384,4 @@ def create_symptom_vector(detected_symptoms: List[str], symptom_columns: List[st
             vector[idx] = 1
 
     return vector
+

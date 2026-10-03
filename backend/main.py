@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
 from model_loader import get_model_and_symptoms
-from symptom_extractor import extract_symptoms, create_symptom_vector, SYMPTOM_SYNONYMS
+from symptom_extractor import extract_symptoms, create_symptom_vector, correct_spelling, SYMPTOM_SYNONYMS
 from predictor import predict_disease
 
 app = FastAPI(
@@ -80,9 +80,13 @@ def get_symptoms():
 def predict(request: PredictRequest):
     """
     Accepts natural language text and/or explicitly checked symptoms.
-    Extracts symptoms via NLP, builds 132-dim vector, and returns top 3 predictions.
+    Applies rapidfuzz spelling correction, extracts symptoms via NLP, builds 132-dim vector,
+    and returns top predictions, recommended specialist, recommendations, and debug info.
     """
     _, symptom_columns = get_model_and_symptoms()
+
+    # 0. Perform rapidfuzz spelling correction on natural language input
+    corrected_sentence = correct_spelling(request.text, symptom_columns) if request.text else ""
 
     # 1. NLP symptom extraction from text
     nlp_detected = extract_symptoms(request.text, symptom_columns) if request.text else []
@@ -105,8 +109,17 @@ def predict(request: PredictRequest):
         "symptom_count": len(valid_detected),
         "predictions": prediction_result["predictions"],
         "recommendations": prediction_result["recommendations"],
-        "disclaimer": prediction_result["disclaimer"]
+        "recommended_specialist": prediction_result.get("recommended_specialist", "General Physician"),
+        "disclaimer": prediction_result["disclaimer"],
+        "debug": {
+            "user_input": request.text or "",
+            "corrected_sentence": corrected_sentence,
+            "extracted_symptoms": valid_detected,
+            "symptom_vector": symptom_vector,
+            "symptom_columns": symptom_columns
+        }
     }
+
 
 
 if __name__ == "__main__":
